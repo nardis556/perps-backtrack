@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Backtrack</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <div id="app">
+
+    <div id="upload-section">
+      <div class="upload-row">
+        <div class="upload-box">
+          <label>Fills CSV</label>
+          <input type="file" id="fills-file" accept=".csv">
+          <span id="fills-status" class="file-status">No file</span>
+        </div>
+        <div class="upload-box">
+          <label>Deposits / Withdrawals CSV</label>
+          <input type="file" id="deposits-file" accept=".csv">
+          <span id="deposits-status" class="file-status">No file</span>
+        </div>
+        <div class="upload-box">
+          <label>Funding CSV (optional)</label>
+          <input type="file" id="funding-file" accept=".csv">
+          <span id="funding-status" class="file-status">No file</span>
+        </div>
+        <div class="upload-box">
+          <label>Environment</label>
+          <select id="env-select">
+            <option value="dev">dev</option>
+            <option value="staging">staging</option>
+            <option value="sandbox">sandbox</option>
+            <option value="prod">prod</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div id="timeline-section" class="hidden">
+      <div class="event-info" id="event-info"></div>
+      <div id="page-row" class="page-row hidden">
+        <button class="btn btn-sm btn-gray hidden" id="btn-page-back10">&laquo;10</button>
+        <button class="btn btn-sm btn-gray" id="btn-page-prev">&laquo; Prev</button>
+        <span class="page-label" id="page-label">Page 1 / 1</span>
+        <button class="btn btn-sm btn-gray" id="btn-page-next">Next &raquo;</button>
+        <button class="btn btn-sm btn-gray hidden" id="btn-page-fwd10">10&raquo;</button>
+      </div>
+      <div class="slider-row">
+        <button class="btn btn-sm btn-gray" id="btn-prev" title="Previous (Left arrow)">&larr;</button>
+        <input type="range" id="timeline-slider" min="0" max="0" value="0">
+        <button class="btn btn-sm btn-gray" id="btn-next" title="Next (Right arrow)">&rarr;</button>
+        <span class="slider-label" id="slider-label">0 / 0</span>
+      </div>
+    </div>
+
+    <div id="content-section" class="hidden">
+      <div class="content-grid">
+        <div class="panel" id="wallet-panel">
+          <div class="panel-header">
+            <h3>Wallet State</h3>
+            <button class="btn btn-sm btn-gray" id="btn-copy-state" title="Copy state as JSON">Copy</button>
+          </div>
+          <table id="wallet-table" class="state-table"></table>
+        </div>
+        <div class="panel" id="positions-panel">
+          <h3>Positions</h3>
+          <div id="positions-content"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="log-section" class="hidden">
+      <div class="log-header">
+        <h3>Event Log</h3>
+        <div class="log-pagination" id="log-pagination"></div>
+      </div>
+      <div class="log-wrapper">
+        <table id="log-table" class="log-table">
+          <thead id="log-head"></thead>
+          <tbody id="log-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+
+</html>

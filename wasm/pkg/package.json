@@ -1,0 +1,15 @@
+{
+  "name": "backtrack-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "backtrack_wasm_bg.wasm",
+    "backtrack_wasm.js",
+    "backtrack_wasm.d.ts"
+  ],
+  "main": "backtrack_wasm.js",
+  "types": "backtrack_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
