@@ -12,6 +12,21 @@ export class Engine {
         wasm.__wbg_engine_free(ptr, 0);
     }
     /**
+     * @returns {string}
+     */
+    get_daily_stats_json() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.engine_get_daily_stats_json(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * @param {number} start
      * @param {number} end
      * @returns {string}
@@ -42,6 +57,26 @@ export class Engine {
             return getStringFromWasm0(ret[0], ret[1]);
         } finally {
             wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @param {number} index
+     * @param {string} prices_json
+     * @param {number} quote_balance_adjustment
+     * @returns {string}
+     */
+    get_state_json_full(index, prices_json, quote_balance_adjustment) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ptr0 = passStringToWasm0(prices_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.engine_get_state_json_full(this.__wbg_ptr, index, ptr0, len0, quote_balance_adjustment);
+            deferred2_0 = ret[0];
+            deferred2_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
         }
     }
     /**

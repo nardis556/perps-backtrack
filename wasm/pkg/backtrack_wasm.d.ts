@@ -4,8 +4,10 @@
 export class Engine {
     free(): void;
     [Symbol.dispose](): void;
+    get_daily_stats_json(): string;
     get_log_page_json(start: number, end: number): string;
     get_state_json(index: number): string;
+    get_state_json_full(index: number, prices_json: string, quote_balance_adjustment: number): string;
     get_state_json_with_prices(index: number, prices_json: string): string;
     constructor();
     process(fills_bytes: Uint8Array, deposits_bytes: Uint8Array, funding_bytes: Uint8Array, configs_json: string): void;
@@ -17,8 +19,10 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_engine_free: (a: number, b: number) => void;
+    readonly engine_get_daily_stats_json: (a: number) => [number, number];
     readonly engine_get_log_page_json: (a: number, b: number, c: number) => [number, number];
     readonly engine_get_state_json: (a: number, b: number) => [number, number];
+    readonly engine_get_state_json_full: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly engine_get_state_json_with_prices: (a: number, b: number, c: number, d: number) => [number, number];
     readonly engine_new: () => number;
     readonly engine_process: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;

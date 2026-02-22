@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use wasm_bindgen::prelude::*;
 use serde::{Serialize, Deserialize};
 
 const CHECKPOINT_INTERVAL: usize = 500;
-const SCALE: i128 = 100_000_000; // 10^8
+const SCALE: i128 = 100_000_000; // 10^8  — 1 unit in fixed-point
 const SCALE_F64: f64 = 100_000_000.0;
 const SCALE_SQ: f64 = SCALE_F64 * SCALE_F64; // 10^16
 const SCALE_CU: f64 = SCALE_F64 * SCALE_F64 * SCALE_F64; // 10^24
-const EPS: i128 = 1; // smallest unit: 0.00000001
+const MIN_QTY: i128 = 1; // smallest representable quantity: 0.00000001
 
 // ============================================================
 // Fixed-point helpers (all i128)
@@ -42,15 +42,15 @@ fn parse_fixed(s: &str) -> i128 {
 
 // Convert SCALE (10^8) to f64
 #[inline]
-fn to_f64_s1(v: i128) -> f64 { v as f64 / SCALE_F64 }
+fn to_f64_s1(value: i128) -> f64 { value as f64 / SCALE_F64 }
 
 // Convert SCALE^2 (10^16) to f64
 #[inline]
-fn to_f64_s2(v: i128) -> f64 { v as f64 / SCALE_SQ }
+fn to_f64_s2(value: i128) -> f64 { value as f64 / SCALE_SQ }
 
 // Convert SCALE^3 (10^24) to f64
 #[inline]
-fn to_f64_s3(v: i128) -> f64 { v as f64 / SCALE_CU }
+fn to_f64_s3(value: i128) -> f64 { value as f64 / SCALE_CU }
 
 // ============================================================
 // Internal types
@@ -63,7 +63,7 @@ fn to_f64_s3(v: i128) -> f64 { v as f64 / SCALE_CU }
 enum Event {
     Deposit {
         timestamp: String,
-        dep_type: String,
+        deposit_type: String,
         amount: i128, // SCALE
     },
     Fill {
@@ -248,6 +248,60 @@ struct StateOut {
     metrics: MetricsOut,
 }
 
+#[derive(Serialize)]
+struct MarketStats {
+    market: String,
+    #[serde(rename = "fillCount")]
+    fill_count: usize,
+    #[serde(rename = "totalVolume")]
+    total_volume: f64,
+    #[serde(rename = "totalFees")]
+    total_fees: f64,
+    #[serde(rename = "totalRealizedPnl")]
+    total_realized_pnl: f64,
+    #[serde(rename = "totalFundingPayments")]
+    total_funding_payments: f64,
+    #[serde(rename = "fundingCount")]
+    funding_count: usize,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    daily: Vec<DailyStats>,
+    markets: Vec<MarketStats>,
+}
+
+#[derive(Serialize)]
+struct DailyStats {
+    date: String,
+    #[serde(rename = "fillCount")]
+    fill_count: usize,
+    #[serde(rename = "depositCount")]
+    deposit_count: usize,
+    #[serde(rename = "withdrawalCount")]
+    withdrawal_count: usize,
+    #[serde(rename = "depositAmount")]
+    deposit_amount: f64,
+    #[serde(rename = "withdrawalAmount")]
+    withdrawal_amount: f64,
+    #[serde(rename = "fundingCount")]
+    funding_count: usize,
+    #[serde(rename = "totalVolume")]
+    total_volume: f64,
+    #[serde(rename = "totalFees")]
+    total_fees: f64,
+    #[serde(rename = "totalRealizedPnl")]
+    total_realized_pnl: f64,
+    #[serde(rename = "totalFundingPayments")]
+    total_funding_payments: f64,
+    #[serde(rename = "endEquity")]
+    end_equity: f64,
+    #[serde(rename = "endQuoteBalance")]
+    end_quote_balance: f64,
+    #[serde(rename = "eventCount")]
+    event_count: usize,
+}
+
 // ============================================================
 // Engine
 // ============================================================
@@ -255,8 +309,8 @@ struct StateOut {
 #[wasm_bindgen]
 pub struct Engine {
     events: Vec<Event>,
-    ev_quote_bal: Vec<i128>,  // SCALE
-    ev_equity: Vec<i128>,     // SCALE^2
+    event_quote_balances: Vec<i128>,  // SCALE
+    event_equities: Vec<i128>,        // SCALE^2
     checkpoints: HashMap<usize, Checkpoint>,
     market_configs: HashMap<String, MarketConfig>,
     total_snapshots: usize,
@@ -267,7 +321,7 @@ impl Engine {
     fn parse_configs(&mut self, json: &str) {
         self.market_configs.clear();
         let inputs: Vec<MarketConfigInput> = match serde_json::from_str(json) {
-            Ok(v) => v,
+            Ok(parsed) => parsed,
             Err(_) => return,
         };
         for input in inputs {
@@ -281,10 +335,10 @@ impl Engine {
         }
     }
 
-    fn apply_event(quote_balance: i128, positions: &mut HashMap<String, Position>, ev: &Event) -> i128 {
-        match ev {
-            Event::Deposit { dep_type, amount, .. } => {
-                if dep_type == "deposit" {
+    fn apply_event(quote_balance: i128, positions: &mut HashMap<String, Position>, event: &Event) -> i128 {
+        match event {
+            Event::Deposit { deposit_type, amount, .. } => {
+                if deposit_type == "deposit" {
                     quote_balance + amount
                 } else {
                     quote_balance - amount
@@ -292,30 +346,30 @@ impl Engine {
             }
             Event::Fill { fill_type, side, price, index_price, quantity, quote_quantity, fee, realized_pnl, market, .. } => {
                 if fill_type == "liquidation" {
-                    for pos in positions.values_mut() {
-                        pos.quantity = 0;
-                        pos.total_notional = 0;
-                        pos.cumulative_realized_pnl = 0;
-                        pos.cumulative_fees = 0;
-                        pos.cumulative_funding = 0;
+                    for position in positions.values_mut() {
+                        position.quantity = 0;
+                        position.total_notional = 0;
+                        position.cumulative_realized_pnl = 0;
+                        position.cumulative_fees = 0;
+                        position.cumulative_funding = 0;
                     }
                     0
                 } else {
-                    let mut qb = quote_balance;
+                    let mut updated_balance = quote_balance;
                     if side == "buy" {
-                        qb -= quote_quantity;
+                        updated_balance -= quote_quantity;
                     } else {
-                        qb += quote_quantity;
+                        updated_balance += quote_quantity;
                     }
-                    qb -= fee;
+                    updated_balance -= fee;
                     Self::process_fill(positions, market, side, *price, *index_price, *quantity, *fee, *realized_pnl);
-                    qb
+                    updated_balance
                 }
             }
             Event::Funding { market, payment_quantity, index_price, .. } => {
-                let pos = positions.entry(market.clone()).or_insert_with(|| Position::new(market));
-                pos.cumulative_funding += payment_quantity;
-                pos.last_index_price = *index_price;
+                let position = positions.entry(market.clone()).or_insert_with(|| Position::new(market));
+                position.cumulative_funding += payment_quantity;
+                position.last_index_price = *index_price;
                 quote_balance + payment_quantity
             }
         }
@@ -326,68 +380,68 @@ impl Engine {
         market: &str, side: &str, price: i128, index_price: i128,
         quantity: i128, fee: i128, realized_pnl: i128,
     ) {
-        let pos = positions.entry(market.to_string()).or_insert_with(|| Position::new(market));
+        let position = positions.entry(market.to_string()).or_insert_with(|| Position::new(market));
 
         let signed_fill_qty: i128 = if side == "buy" { quantity } else { -quantity };
-        let old_qty = pos.quantity;
-        let new_qty = old_qty + signed_fill_qty;
+        let old_quantity = position.quantity;
+        let new_quantity = old_quantity + signed_fill_qty;
 
-        let same_direction = old_qty.abs() < EPS
-            || (old_qty > 0 && signed_fill_qty > 0)
-            || (old_qty < 0 && signed_fill_qty < 0);
+        let is_same_direction = old_quantity.abs() < MIN_QTY
+            || (old_quantity > 0 && signed_fill_qty > 0)
+            || (old_quantity < 0 && signed_fill_qty < 0);
 
-        let crosses_zero = old_qty.abs() >= EPS
-            && ((old_qty > 0 && new_qty < 0) || (old_qty < 0 && new_qty > 0));
+        let crosses_zero = old_quantity.abs() >= MIN_QTY
+            && ((old_quantity > 0 && new_quantity < 0) || (old_quantity < 0 && new_quantity > 0));
 
-        if same_direction {
-            if old_qty.abs() < EPS {
+        if is_same_direction {
+            if old_quantity.abs() < MIN_QTY {
                 // Fresh open — raw product, no division (SCALE^2)
-                pos.total_notional = quantity * price;
-                pos.cumulative_realized_pnl = 0;
-                pos.cumulative_fees = 0;
-                pos.cumulative_funding = 0;
+                position.total_notional = quantity * price;
+                position.cumulative_realized_pnl = 0;
+                position.cumulative_fees = 0;
+                position.cumulative_funding = 0;
             } else {
                 // Add to position — raw product, no division (SCALE^2)
-                pos.total_notional += quantity * price;
+                position.total_notional += quantity * price;
             }
-            pos.quantity = new_qty;
+            position.quantity = new_quantity;
         } else if crosses_zero {
             // closeAndOpen — new position with remainder
-            pos.quantity = new_qty;
-            pos.total_notional = new_qty.abs() * price; // SCALE^2
-            pos.cumulative_realized_pnl = 0;
-            pos.cumulative_fees = 0;
-            pos.cumulative_funding = 0;
+            position.quantity = new_quantity;
+            position.total_notional = new_quantity.abs() * price; // SCALE^2
+            position.cumulative_realized_pnl = 0;
+            position.cumulative_fees = 0;
+            position.cumulative_funding = 0;
         } else {
             // Reducing position
-            if new_qty.abs() < EPS {
-                pos.quantity = 0;
-                pos.total_notional = 0;
+            if new_quantity.abs() < MIN_QTY {
+                position.quantity = 0;
+                position.total_notional = 0;
             } else {
                 // Proportional notional reduction — single division, no intermediate entry_price
-                let close_qty = quantity.min(old_qty.abs());
-                let removed = pos.total_notional * close_qty / old_qty.abs();
-                pos.total_notional -= removed;
-                pos.quantity = new_qty;
+                let close_quantity = quantity.min(old_quantity.abs());
+                let removed_notional = position.total_notional * close_quantity / old_quantity.abs();
+                position.total_notional -= removed_notional;
+                position.quantity = new_quantity;
             }
         }
 
-        pos.cumulative_realized_pnl += realized_pnl;
-        pos.cumulative_fees += fee;
-        pos.last_index_price = index_price;
+        position.cumulative_realized_pnl += realized_pnl;
+        position.cumulative_fees += fee;
+        position.last_index_price = index_price;
     }
 
-    fn tiered_imf(&self, abs_qty: i128, mc: &MarketConfig) -> i128 {
-        let imf = mc.initial_margin_fraction;
-        if abs_qty <= mc.base_position_size {
+    fn tiered_imf(&self, abs_quantity: i128, config: &MarketConfig) -> i128 {
+        let imf = config.initial_margin_fraction;
+        if abs_quantity <= config.base_position_size {
             return imf;
         }
-        let diff = abs_qty - mc.base_position_size;
-        // ceil(diff / incremental_position_size) — both are SCALE, scales cancel
-        let inc = mc.incremental_position_size;
-        let steps = (diff + inc - 1) / inc;
+        let excess = abs_quantity - config.base_position_size;
+        // ceil(excess / incremental_position_size) — both are SCALE, scales cancel
+        let increment = config.incremental_position_size;
+        let steps = (excess + increment - 1) / increment;
         // steps is unscaled integer, incremental_imf is SCALE → result is SCALE
-        imf + steps * mc.incremental_initial_margin_fraction
+        imf + steps * config.incremental_initial_margin_fraction
     }
 
     // All intermediate values tracked at their natural scale.
@@ -401,43 +455,43 @@ impl Engine {
         let mut total_realized_pnl: i128 = 0;         // SCALE
         let mut total_funding: i128 = 0;               // SCALE
         let mut total_fees: i128 = 0;                  // SCALE
-        let mut open_count = 0usize;
+        let mut open_position_count = 0usize;
 
-        for pos in positions.values() {
-            total_realized_pnl += pos.cumulative_realized_pnl;
-            total_funding += pos.cumulative_funding;
-            total_fees += pos.cumulative_fees;
+        for position in positions.values() {
+            total_realized_pnl += position.cumulative_realized_pnl;
+            total_funding += position.cumulative_funding;
+            total_fees += position.cumulative_fees;
 
-            if pos.quantity.abs() < EPS { continue; }
-            open_count += 1;
+            if position.quantity.abs() < MIN_QTY { continue; }
+            open_position_count += 1;
 
-            let qty = pos.quantity;
-            let abs_qty = qty.abs();
-            let ip = pos.last_index_price;
+            let quantity = position.quantity;
+            let abs_quantity = quantity.abs();
+            let index_price = position.last_index_price;
 
             // qty * ip — no division (SCALE^2)
-            index_notional_sum += qty * ip;
-            total_abs_index_notional += abs_qty * ip;
+            index_notional_sum += quantity * index_price;
+            total_abs_index_notional += abs_quantity * index_price;
 
             // Unrealized PnL directly from total_notional — no intermediate entry_price
             // uPnL = (indexPrice - entryPrice) * qty
             //       = indexPrice * qty - entryPrice * abs(qty) * sign(qty)
             //       = indexPrice * qty - total_notional * sign(qty)
             // All terms in SCALE^2
-            let sign_qty: i128 = if qty > 0 { 1 } else { -1 };
-            total_unrealized_pnl += ip * qty - pos.total_notional * sign_qty;
+            let sign: i128 = if quantity > 0 { 1 } else { -1 };
+            total_unrealized_pnl += index_price * quantity - position.total_notional * sign;
 
-            if let Some(mc) = self.market_configs.get(&pos.market) {
-                let imf = self.tiered_imf(abs_qty, mc);
-                let mmf = mc.maintenance_margin_fraction;
+            if let Some(config) = self.market_configs.get(&position.market) {
+                let imf = self.tiered_imf(abs_quantity, config);
+                let mmf = config.maintenance_margin_fraction;
                 // imf * abs_qty * ip — no intermediate division (SCALE^3)
-                total_imr += imf * abs_qty * ip;
-                total_mmr += mmf * abs_qty * ip;
+                total_imr += imf * abs_quantity * index_price;
+                total_mmr += mmf * abs_quantity * index_price;
             }
         }
 
         // equity = quoteBalance + sum(qty * indexPrice)
-        // Promote qb from SCALE to SCALE^2, then add SCALE^2 notional sum
+        // Promote quote_balance from SCALE to SCALE^2, then add SCALE^2 notional sum
         let equity_s2: i128 = quote_balance * SCALE + index_notional_sum;
 
         // free_collateral = equity - totalIMR
@@ -446,7 +500,7 @@ impl Engine {
 
         // leverage = totalAbsIndexNotional / equity (dimensionless)
         // Both SCALE^2 — ratio computed as f64
-        let leverage_f64 = if total_abs_index_notional == 0 || equity_s2 == 0 {
+        let leverage = if total_abs_index_notional == 0 || equity_s2 == 0 {
             0.0
         } else {
             total_abs_index_notional as f64 / equity_s2 as f64
@@ -454,7 +508,7 @@ impl Engine {
 
         // margin_ratio = totalMMR / equity
         // mmr is SCALE^3, equity is SCALE^2 — ratio is SCALE, convert with to_f64_s1
-        let margin_ratio_f64 = if equity_s2 == 0 {
+        let margin_ratio = if equity_s2 == 0 {
             0.0
         } else {
             (total_mmr / equity_s2) as f64 / SCALE_F64
@@ -467,53 +521,53 @@ impl Engine {
             total_imr: to_f64_s3(total_imr),
             total_mmr: to_f64_s3(total_mmr),
             free_collateral: to_f64_s3(free_collateral_s3),
-            leverage: leverage_f64,
-            margin_ratio: margin_ratio_f64,
+            leverage,
+            margin_ratio,
             total_realized_pnl: to_f64_s1(total_realized_pnl),
             total_funding: to_f64_s1(total_funding),
             total_fees: to_f64_s1(total_fees),
-            open_positions: open_count,
+            open_positions: open_position_count,
         }
     }
 
     fn calculate_liquidation_price(&self, market: &str, quote_balance: i128, positions: &HashMap<String, Position>) -> i128 {
-        let pos = match positions.get(market) {
-            Some(p) if p.quantity.abs() >= EPS => p,
+        let target_position = match positions.get(market) {
+            Some(position) if position.quantity.abs() >= MIN_QTY => position,
             _ => return 0,
         };
 
-        let mc = match self.market_configs.get(market) {
-            Some(c) => c,
+        let config = match self.market_configs.get(market) {
+            Some(config) => config,
             None => return 0,
         };
 
-        let qty = pos.quantity;
-        let abs_qty = qty.abs();
-        let mmf = mc.maintenance_margin_fraction;
+        let quantity = target_position.quantity;
+        let abs_quantity = quantity.abs();
+        let mmf = config.maintenance_margin_fraction;
 
         // denom = abs(qty) * mmf - qty
-        // abs_qty * mmf is SCALE^2, qty is SCALE — promote qty to SCALE^2
-        let denom_s2: i128 = abs_qty * mmf - qty * SCALE;
-        if denom_s2.abs() < EPS { return 0; }
+        // abs_quantity * mmf is SCALE^2, qty is SCALE — promote qty to SCALE^2
+        let denominator = abs_quantity * mmf - quantity * SCALE;
+        if denominator.abs() < MIN_QTY { return 0; }
 
-        // num starts as quote_balance (SCALE) — promote to SCALE^2
-        let mut num_s2: i128 = quote_balance * SCALE;
-        for (m, p) in positions.iter() {
-            if m == market { continue; }
-            if p.quantity.abs() < EPS { continue; }
-            if let Some(omc) = self.market_configs.get(m.as_str()) {
-                let pqty = p.quantity;
-                let pip = p.last_index_price;
-                let ommf = omc.maintenance_margin_fraction;
+        // numerator starts as quote_balance (SCALE) — promote to SCALE^2
+        let mut numerator = quote_balance * SCALE;
+        for (other_market, other_position) in positions.iter() {
+            if other_market == market { continue; }
+            if other_position.quantity.abs() < MIN_QTY { continue; }
+            if let Some(other_config) = self.market_configs.get(other_market.as_str()) {
+                let other_quantity = other_position.quantity;
+                let other_index_price = other_position.last_index_price;
+                let other_mmf = other_config.maintenance_margin_fraction;
                 // qty * indexPrice (SCALE^2) - abs(qty) * indexPrice * mmf (SCALE^3 / SCALE → SCALE^2)
-                num_s2 += pqty * pip - pqty.abs() * pip * ommf / SCALE;
+                numerator += other_quantity * other_index_price - other_quantity.abs() * other_index_price * other_mmf / SCALE;
             }
         }
 
-        // liq_price = num / denom — both SCALE^2, result is dimensionless
-        // We want liq_price in SCALE, so multiply num by SCALE first
-        let liq_price = num_s2 * SCALE / denom_s2;
-        if liq_price > 0 { liq_price } else { 0 }
+        // liq_price = numerator / denominator — both SCALE^2, result is dimensionless
+        // We want liq_price in SCALE, so multiply numerator by SCALE first
+        let liquidation_price = numerator * SCALE / denominator;
+        if liquidation_price > 0 { liquidation_price } else { 0 }
     }
 
     fn replay_to(&self, index: usize) -> (i128, HashMap<String, Position>) {
@@ -521,24 +575,24 @@ impl Engine {
             return (0, HashMap::new());
         }
 
-        let cp_idx = (index / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
-        let cp = &self.checkpoints[&cp_idx];
-        let mut quote_balance = cp.quote_balance;
-        let mut positions = cp.positions.clone();
+        let checkpoint_index = (index / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+        let checkpoint = &self.checkpoints[&checkpoint_index];
+        let mut quote_balance = checkpoint.quote_balance;
+        let mut positions = checkpoint.positions.clone();
 
-        for i in cp_idx..index {
+        for i in checkpoint_index..index {
             quote_balance = Self::apply_event(quote_balance, &mut positions, &self.events[i]);
         }
 
         (quote_balance, positions)
     }
 
-    fn make_event_out(ev: &Event) -> EventOut {
-        match ev {
-            Event::Deposit { timestamp, dep_type, amount } => EventOut {
+    fn make_event_out(event: &Event) -> EventOut {
+        match event {
+            Event::Deposit { timestamp, deposit_type, amount } => EventOut {
                 kind: "deposit".to_string(),
                 time: timestamp.clone(),
-                event_type: dep_type.clone(),
+                event_type: deposit_type.clone(),
                 market: String::new(),
                 side: String::new(),
                 quantity: 0.0,
@@ -573,45 +627,45 @@ impl Engine {
 
     fn make_positions_out(&self, quote_balance: i128, positions: &HashMap<String, Position>) -> Vec<PositionOut> {
         positions.values()
-            .filter(|p| p.quantity.abs() >= EPS)
-            .map(|p| {
-                let qty = p.quantity;
-                let abs_qty = qty.abs();
-                let ip = p.last_index_price;
+            .filter(|position| position.quantity.abs() >= MIN_QTY)
+            .map(|position| {
+                let quantity = position.quantity;
+                let abs_quantity = quantity.abs();
+                let index_price = position.last_index_price;
 
                 // Notional: abs_qty * ip (SCALE^2, no division)
-                let notional_s2 = abs_qty * ip;
+                let notional = abs_quantity * index_price;
 
                 // Entry price: total_notional / abs_qty (SCALE^2 / SCALE = SCALE)
-                let entry_price_s1 = if abs_qty > 0 { p.total_notional / abs_qty } else { 0 };
+                let entry_price = if abs_quantity > 0 { position.total_notional / abs_quantity } else { 0 };
 
                 // Unrealized PnL: ip * qty - total_notional * sign (SCALE^2, no intermediate)
-                let sign_qty: i128 = if qty > 0 { 1 } else { -1 };
-                let upnl_s2 = ip * qty - p.total_notional * sign_qty;
+                let sign: i128 = if quantity > 0 { 1 } else { -1 };
+                let unrealized_pnl = index_price * quantity - position.total_notional * sign;
 
-                let liq_price = self.calculate_liquidation_price(&p.market, quote_balance, positions);
+                let liquidation_price = self.calculate_liquidation_price(&position.market, quote_balance, positions);
 
-                let (imr_s3, mmr_s3) = if let Some(mc) = self.market_configs.get(&p.market) {
-                    let imf = self.tiered_imf(abs_qty, mc);
-                    let mmf = mc.maintenance_margin_fraction;
+                let (initial_margin, maintenance_margin) = if let Some(config) = self.market_configs.get(&position.market) {
+                    let imf = self.tiered_imf(abs_quantity, config);
+                    let mmf = config.maintenance_margin_fraction;
                     // imf * abs_qty * ip (SCALE^3, no intermediate division)
-                    (imf * abs_qty * ip, mmf * abs_qty * ip)
+                    (imf * abs_quantity * index_price, mmf * abs_quantity * index_price)
                 } else {
                     (0i128, 0i128)
                 };
 
                 PositionOut {
-                    market: p.market.clone(),
-                    quantity: to_f64_s1(qty),
-                    entry_price: to_f64_s1(entry_price_s1),
-                    last_index_price: to_f64_s1(ip),
-                    notional: to_f64_s2(notional_s2),
-                    unrealized_pnl: to_f64_s2(upnl_s2),
-                    cumulative_realized_pnl: to_f64_s1(p.cumulative_realized_pnl),
-                    cumulative_funding: to_f64_s1(p.cumulative_funding),
-                    liquidation_price: to_f64_s1(liq_price),
-                    imr: to_f64_s3(imr_s3),
-                    mmr: to_f64_s3(mmr_s3),
+                    market: position.market.clone(),
+                    quantity: to_f64_s1(quantity),
+                    entry_price: to_f64_s1(entry_price),
+                    last_index_price: to_f64_s1(index_price),
+                    notional: to_f64_s2(notional),
+                    unrealized_pnl: to_f64_s2(unrealized_pnl),
+                    cumulative_realized_pnl: to_f64_s1(position.cumulative_realized_pnl),
+                    cumulative_funding: to_f64_s1(position.cumulative_funding),
+                    liquidation_price: to_f64_s1(liquidation_price),
+                    imr: to_f64_s3(initial_margin),
+                    mmr: to_f64_s3(maintenance_margin),
                 }
             })
             .collect()
@@ -626,8 +680,8 @@ impl Engine {
         console_error_panic_hook::set_once();
         Engine {
             events: Vec::new(),
-            ev_quote_bal: Vec::new(),
-            ev_equity: Vec::new(),
+            event_quote_balances: Vec::new(),
+            event_equities: Vec::new(),
             checkpoints: HashMap::new(),
             market_configs: HashMap::new(),
             total_snapshots: 0,
@@ -649,7 +703,7 @@ impl Engine {
             if cols.len() < 4 { continue; }
             events.push(Event::Deposit {
                 timestamp: cols[0].to_string(),
-                dep_type: cols[1].to_string(),
+                deposit_type: cols[1].to_string(),
                 amount: parse_fixed(cols[3]),
             });
         }
@@ -690,8 +744,8 @@ impl Engine {
         events.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
 
         self.total_snapshots = events.len() + 1;
-        self.ev_quote_bal = vec![0i128; self.total_snapshots];
-        self.ev_equity = vec![0i128; self.total_snapshots];
+        self.event_quote_balances = vec![0i128; self.total_snapshots];
+        self.event_equities = vec![0i128; self.total_snapshots];
         self.checkpoints.clear();
 
         // Initial checkpoint
@@ -703,24 +757,24 @@ impl Engine {
         let mut quote_balance: i128 = 0;
         let mut positions: HashMap<String, Position> = HashMap::new();
 
-        for (i, ev) in events.iter().enumerate() {
-            quote_balance = Self::apply_event(quote_balance, &mut positions, ev);
+        for (i, event) in events.iter().enumerate() {
+            quote_balance = Self::apply_event(quote_balance, &mut positions, event);
 
-            let snap_idx = i + 1;
-            self.ev_quote_bal[snap_idx] = quote_balance; // SCALE
+            let snapshot_index = i + 1;
+            self.event_quote_balances[snapshot_index] = quote_balance; // SCALE
 
-            // Equity: qb * SCALE + sum(qty * ip) — all SCALE^2, no truncation
-            let mut equity_s2: i128 = quote_balance * SCALE;
-            for pos in positions.values() {
-                if pos.quantity.abs() >= EPS {
-                    equity_s2 += pos.quantity * pos.last_index_price;
+            // Equity: quote_balance * SCALE + sum(qty * ip) — all SCALE^2, no truncation
+            let mut equity: i128 = quote_balance * SCALE;
+            for position in positions.values() {
+                if position.quantity.abs() >= MIN_QTY {
+                    equity += position.quantity * position.last_index_price;
                 }
             }
-            self.ev_equity[snap_idx] = equity_s2; // SCALE^2
+            self.event_equities[snapshot_index] = equity; // SCALE^2
 
-            // Checkpoint at regular intervals
-            if snap_idx % CHECKPOINT_INTERVAL == 0 {
-                self.checkpoints.insert(snap_idx, Checkpoint {
+            // Checkpoint at regular intervals for fast seeking
+            if snapshot_index % CHECKPOINT_INTERVAL == 0 {
+                self.checkpoints.insert(snapshot_index, Checkpoint {
                     quote_balance,
                     positions: positions.clone(),
                 });
@@ -735,28 +789,28 @@ impl Engine {
     }
 
     pub fn get_log_page_json(&self, start: usize, end: usize) -> String {
-        let cap = if end >= start { end - start + 1 } else { 0 };
-        let mut entries = Vec::with_capacity(cap.min(self.total_snapshots));
+        let capacity = if end >= start { end - start + 1 } else { 0 };
+        let mut entries = Vec::with_capacity(capacity.min(self.total_snapshots));
 
         let actual_end = end.min(self.total_snapshots - 1);
         for i in start..=actual_end {
             if i == 0 { continue; }
-            let ev = &self.events[i - 1];
+            let event = &self.events[i - 1];
 
-            let entry = match ev {
-                Event::Deposit { timestamp, dep_type, amount } => LogEntry {
+            let entry = match event {
+                Event::Deposit { timestamp, deposit_type, amount } => LogEntry {
                     index: i,
                     time: timestamp.clone(),
                     kind: "deposit".to_string(),
-                    event_type: dep_type.clone(),
+                    event_type: deposit_type.clone(),
                     market: String::new(),
                     side: String::new(),
                     qty: to_f64_s1(*amount),
                     price: 0.0,
                     fee: 0.0,
                     rpnl: 0.0,
-                    quote_bal: to_f64_s1(self.ev_quote_bal[i]),
-                    equity: to_f64_s2(self.ev_equity[i]),
+                    quote_bal: to_f64_s1(self.event_quote_balances[i]),
+                    equity: to_f64_s2(self.event_equities[i]),
                 },
                 Event::Fill { time, market, side, fill_type, price, quantity, fee, realized_pnl, .. } => LogEntry {
                     index: i,
@@ -769,8 +823,8 @@ impl Engine {
                     price: to_f64_s1(*price),
                     fee: to_f64_s1(*fee),
                     rpnl: to_f64_s1(*realized_pnl),
-                    quote_bal: to_f64_s1(self.ev_quote_bal[i]),
-                    equity: to_f64_s2(self.ev_equity[i]),
+                    quote_bal: to_f64_s1(self.event_quote_balances[i]),
+                    equity: to_f64_s2(self.event_equities[i]),
                 },
                 Event::Funding { time, market, payment_quantity, index_price, .. } => LogEntry {
                     index: i,
@@ -783,8 +837,8 @@ impl Engine {
                     price: to_f64_s1(*index_price),
                     fee: 0.0,
                     rpnl: to_f64_s1(*payment_quantity),
-                    quote_bal: to_f64_s1(self.ev_quote_bal[i]),
-                    equity: to_f64_s2(self.ev_equity[i]),
+                    quote_bal: to_f64_s1(self.event_quote_balances[i]),
+                    equity: to_f64_s2(self.event_equities[i]),
                 },
             };
             entries.push(entry);
@@ -794,29 +848,161 @@ impl Engine {
     }
 
     pub fn get_state_json(&self, index: usize) -> String {
-        self.get_state_json_inner(index, None)
+        self.get_state_json_inner(index, None, None)
     }
 
     pub fn get_state_json_with_prices(&self, index: usize, prices_json: &str) -> String {
         let overrides: HashMap<String, f64> = serde_json::from_str(prices_json).unwrap_or_default();
-        self.get_state_json_inner(index, Some(&overrides))
+        self.get_state_json_inner(index, Some(&overrides), None)
+    }
+
+    pub fn get_state_json_full(&self, index: usize, prices_json: &str, quote_balance_adjustment: f64) -> String {
+        let overrides: HashMap<String, f64> = serde_json::from_str(prices_json).unwrap_or_default();
+        let adj = if quote_balance_adjustment.abs() > 1e-12 {
+            Some((quote_balance_adjustment * SCALE_F64) as i128)
+        } else {
+            None
+        };
+        self.get_state_json_inner(index, Some(&overrides), adj)
+    }
+
+    pub fn get_daily_stats_json(&self) -> String {
+        struct DayAccum {
+            fill_count: usize,
+            deposit_count: usize,
+            withdrawal_count: usize,
+            deposit_amount: i128,
+            withdrawal_amount: i128,
+            funding_count: usize,
+            total_volume: i128,
+            total_fees: i128,
+            total_realized_pnl: i128,
+            total_funding_payments: i128,
+            last_event_index: usize,
+            event_count: usize,
+        }
+
+        let mut days: BTreeMap<String, DayAccum> = BTreeMap::new();
+
+        struct MktAccum {
+            fill_count: usize,
+            total_volume: i128,
+            total_fees: i128,
+            total_realized_pnl: i128,
+            total_funding_payments: i128,
+            funding_count: usize,
+        }
+        let mut markets: BTreeMap<String, MktAccum> = BTreeMap::new();
+
+        for (i, event) in self.events.iter().enumerate() {
+            let time_str = event.sort_key();
+            let date = if time_str.len() >= 10 { &time_str[..10] } else { time_str };
+            let snapshot_index = i + 1;
+
+            let accum = days.entry(date.to_string()).or_insert_with(|| DayAccum {
+                fill_count: 0, deposit_count: 0, withdrawal_count: 0,
+                deposit_amount: 0, withdrawal_amount: 0, funding_count: 0,
+                total_volume: 0, total_fees: 0, total_realized_pnl: 0,
+                total_funding_payments: 0, last_event_index: 0, event_count: 0,
+            });
+
+            accum.event_count += 1;
+            accum.last_event_index = snapshot_index;
+
+            match event {
+                Event::Fill { market, quote_quantity, fee, realized_pnl, .. } => {
+                    accum.fill_count += 1;
+                    accum.total_volume += quote_quantity;
+                    accum.total_fees += fee;
+                    accum.total_realized_pnl += realized_pnl;
+
+                    let ma = markets.entry(market.clone()).or_insert_with(|| MktAccum {
+                        fill_count: 0, total_volume: 0, total_fees: 0,
+                        total_realized_pnl: 0, total_funding_payments: 0, funding_count: 0,
+                    });
+                    ma.fill_count += 1;
+                    ma.total_volume += quote_quantity;
+                    ma.total_fees += fee;
+                    ma.total_realized_pnl += realized_pnl;
+                }
+                Event::Deposit { deposit_type, amount, .. } => {
+                    if deposit_type == "deposit" {
+                        accum.deposit_count += 1;
+                        accum.deposit_amount += amount;
+                    } else {
+                        accum.withdrawal_count += 1;
+                        accum.withdrawal_amount += amount;
+                    }
+                }
+                Event::Funding { market, payment_quantity, .. } => {
+                    accum.funding_count += 1;
+                    accum.total_funding_payments += payment_quantity;
+
+                    let ma = markets.entry(market.clone()).or_insert_with(|| MktAccum {
+                        fill_count: 0, total_volume: 0, total_fees: 0,
+                        total_realized_pnl: 0, total_funding_payments: 0, funding_count: 0,
+                    });
+                    ma.funding_count += 1;
+                    ma.total_funding_payments += payment_quantity;
+                }
+            }
+        }
+
+        let daily: Vec<DailyStats> = days.into_iter().map(|(date, a)| {
+            DailyStats {
+                date,
+                fill_count: a.fill_count,
+                deposit_count: a.deposit_count,
+                withdrawal_count: a.withdrawal_count,
+                deposit_amount: to_f64_s1(a.deposit_amount),
+                withdrawal_amount: to_f64_s1(a.withdrawal_amount),
+                funding_count: a.funding_count,
+                total_volume: to_f64_s1(a.total_volume),
+                total_fees: to_f64_s1(a.total_fees),
+                total_realized_pnl: to_f64_s1(a.total_realized_pnl),
+                total_funding_payments: to_f64_s1(a.total_funding_payments),
+                end_equity: to_f64_s2(self.event_equities[a.last_event_index]),
+                end_quote_balance: to_f64_s1(self.event_quote_balances[a.last_event_index]),
+                event_count: a.event_count,
+            }
+        }).collect();
+
+        let market_stats: Vec<MarketStats> = markets.into_iter().map(|(market, a)| {
+            MarketStats {
+                market,
+                fill_count: a.fill_count,
+                total_volume: to_f64_s1(a.total_volume),
+                total_fees: to_f64_s1(a.total_fees),
+                total_realized_pnl: to_f64_s1(a.total_realized_pnl),
+                total_funding_payments: to_f64_s1(a.total_funding_payments),
+                funding_count: a.funding_count,
+            }
+        }).collect();
+
+        let response = StatsResponse { daily, markets: market_stats };
+        serde_json::to_string(&response).unwrap_or_else(|_| "{\"daily\":[],\"markets\":[]}".to_string())
     }
 }
 
 impl Engine {
-    fn get_state_json_inner(&self, index: usize, price_overrides: Option<&HashMap<String, f64>>) -> String {
+    fn get_state_json_inner(&self, index: usize, price_overrides: Option<&HashMap<String, f64>>, quote_balance_adjustment: Option<i128>) -> String {
         if index >= self.total_snapshots {
             return "{}".to_string();
         }
 
-        let (quote_balance, mut positions) = self.replay_to(index);
+        let (mut quote_balance, mut positions) = self.replay_to(index);
 
         if let Some(overrides) = price_overrides {
             for (market, price) in overrides {
-                if let Some(pos) = positions.get_mut(market) {
-                    pos.last_index_price = (*price * SCALE_F64) as i128;
+                if let Some(position) = positions.get_mut(market) {
+                    position.last_index_price = (*price * SCALE_F64) as i128;
                 }
             }
+        }
+
+        // Apply quote balance adjustment (modifying equity by adjusting quote balance)
+        if let Some(adj) = quote_balance_adjustment {
+            quote_balance += adj;
         }
 
         let metrics = self.compute_metrics(quote_balance, &positions);

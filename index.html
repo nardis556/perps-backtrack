@@ -37,6 +37,10 @@
             <option value="prod">prod</option>
           </select>
         </div>
+        <div class="upload-box">
+          <label>&nbsp;</label>
+          <button class="btn btn-sm btn-gray" id="btn-heatmap" title="Daily activity heatmap">Calendar</button>
+        </div>
       </div>
     </div>
 
@@ -64,6 +68,12 @@
             <h3>Wallet State</h3>
             <button class="btn btn-sm btn-gray" id="btn-copy-state" title="Copy state as JSON">Copy</button>
           </div>
+          <div class="adjust-row">
+            <label>Adjust QB</label>
+            <input type="text" id="qb-adjust-input" class="idx-price-input" placeholder="0" title="Quote balance adjustment (e.g. +5000 or -2000)">
+            <span class="adjust-unit">USDC</span>
+            <button class="btn btn-sm btn-gray" id="btn-qb-reset" title="Reset adjustment">Reset</button>
+          </div>
           <table id="wallet-table" class="state-table"></table>
         </div>
         <div class="panel" id="positions-panel">
@@ -84,6 +94,17 @@
           <tbody id="log-body"></tbody>
         </table>
       </div>
+    </div>
+
+  </div>
+
+  <div id="heatmap-modal" class="modal-overlay hidden">
+    <div class="modal-content">
+      <div class="modal-hdr">
+        <h3>Daily Activity</h3>
+        <button class="btn btn-sm btn-gray" id="btn-heatmap-close">&times;</button>
+      </div>
+      <div id="heatmap-body"></div>
     </div>
   </div>
 

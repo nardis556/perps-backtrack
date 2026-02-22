@@ -22,8 +22,14 @@
   // Custom index price overrides: { market: price }
   var priceOverrides = {};
 
+  // Quote balance adjustment (equity modifier)
+  var quoteBalanceAdjustment = 0;
+
   // Last rendered state for clipboard
   var lastState = null;
+
+  // Daily stats cache for heatmap
+  var dailyStatsCache = null;
 
   // ============================================================
   // HELPERS
@@ -101,6 +107,7 @@
 
       document.getElementById('content-section').classList.remove('hidden');
       document.getElementById('log-section').classList.remove('hidden');
+      dailyStatsCache = null;
       document.getElementById('page-row').classList.toggle('hidden', totalSliderPages() <= 1);
 
       updateSlider();
@@ -124,6 +131,12 @@
       renderLogPagination();
       highlightLogRow();
     }
+
+    else if (msg.type === 'dailyStats') {
+      var parsed = JSON.parse(msg.json);
+      dailyStatsCache = parsed;
+      renderHeatmap(parsed);
+    }
   };
 
   function requestState(index) {
@@ -136,6 +149,7 @@
       var msg = { type: 'getState', index: currentIndex };
       var keys = Object.keys(priceOverrides);
       if (keys.length > 0) msg.pricesJson = JSON.stringify(priceOverrides);
+      if (Math.abs(quoteBalanceAdjustment) > 1e-12) msg.adjustment = quoteBalanceAdjustment;
       worker.postMessage(msg);
     });
   }
@@ -379,7 +393,8 @@
     if (!file) return;
 
     var statusEl = document.getElementById(type + '-status');
-    statusEl.textContent = file.name + ' (' + (file.size / 1024 / 1024).toFixed(1) + ' MB)';
+    var displayName = file.name.length > 12 ? file.name.slice(0, 8) + '...' + file.name.slice(-4) : file.name;
+    statusEl.textContent = displayName + ' (' + (file.size / 1024 / 1024).toFixed(1) + ' MB)';
     statusEl.classList.add('loaded');
 
     // Read as ArrayBuffer — no string parsing on main thread
@@ -499,6 +514,18 @@
     requestState(currentIndex);
   });
 
+  document.getElementById('qb-adjust-input').addEventListener('change', function() {
+    var val = parseFloat(this.value);
+    quoteBalanceAdjustment = isNaN(val) ? 0 : val;
+    requestState(currentIndex);
+  });
+
+  document.getElementById('btn-qb-reset').addEventListener('click', function() {
+    quoteBalanceAdjustment = 0;
+    document.getElementById('qb-adjust-input').value = '';
+    requestState(currentIndex);
+  });
+
   document.getElementById('log-body').addEventListener('click', function(e) {
     var row = e.target.closest('tr[data-index]');
     if (row) goTo(parseInt(row.dataset.index, 10));
@@ -532,5 +559,293 @@
       requestLogPage();
     }
   });
+
+  // ============================================================
+  // HEATMAP
+  // ============================================================
+
+  document.getElementById('btn-heatmap').addEventListener('click', function() {
+    var modal = document.getElementById('heatmap-modal');
+    modal.classList.remove('hidden');
+    if (dailyStatsCache) {
+      renderHeatmap(dailyStatsCache);
+    } else if (totalSnaps > 0) {
+      worker.postMessage({ type: 'getDailyStats' });
+    } else {
+      document.getElementById('heatmap-body').innerHTML =
+        '<div style="color:#718096;text-align:center;padding:20px">Upload and process files first</div>';
+    }
+  });
+
+  document.getElementById('btn-heatmap-close').addEventListener('click', function() {
+    document.getElementById('heatmap-modal').classList.add('hidden');
+  });
+
+  document.getElementById('heatmap-modal').addEventListener('click', function(e) {
+    if (e.target === this) this.classList.add('hidden');
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+      document.getElementById('heatmap-modal').classList.add('hidden');
+    }
+  });
+
+  function renderHeatmap(data) {
+    var days = data.daily || data;
+    var markets = data.markets || [];
+    var body = document.getElementById('heatmap-body');
+    if (!days || days.length === 0) {
+      body.innerHTML = '<div style="color:#718096;text-align:center;padding:20px">No data</div>';
+      return;
+    }
+
+    // Build day lookup
+    var dayMap = {};
+    for (var i = 0; i < days.length; i++) {
+      dayMap[days[i].date] = days[i];
+    }
+
+    // Date range — pad to full weeks
+    var firstDate = new Date(days[0].date + 'T00:00:00');
+    var lastDate = new Date(days[days.length - 1].date + 'T00:00:00');
+
+    var gridStart = new Date(firstDate);
+    gridStart.setDate(gridStart.getDate() - gridStart.getDay());
+
+    var gridEnd = new Date(lastDate);
+    gridEnd.setDate(gridEnd.getDate() + (6 - gridEnd.getDay()));
+
+    // Max events for intensity scaling
+    var maxEvents = 0;
+    for (var i = 0; i < days.length; i++) {
+      if (days[i].eventCount > maxEvents) maxEvents = days[i].eventCount;
+    }
+
+    // Build cells
+    var cells = [];
+    var d = new Date(gridStart);
+    while (d <= gridEnd) {
+      var key = d.getFullYear() + '-' +
+        String(d.getMonth() + 1).padStart(2, '0') + '-' +
+        String(d.getDate()).padStart(2, '0');
+      cells.push({ date: key, stats: dayMap[key] || null });
+      d.setDate(d.getDate() + 1);
+    }
+
+    // Month labels
+    var weekCount = Math.ceil(cells.length / 7);
+    var monthLabels = [];
+    var lastMonth = -1;
+    var monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    for (var w = 0; w < weekCount; w++) {
+      var cd = new Date(cells[w * 7].date + 'T00:00:00');
+      var m = cd.getMonth();
+      if (m !== lastMonth) {
+        monthLabels.push({ col: w, label: monthNames[m] + ' ' + cd.getFullYear() });
+        lastMonth = m;
+      }
+    }
+
+    // Build HTML
+    var html = '<div class="heatmap-container">';
+
+    // Month labels — skip if too close to previous (< 5 weeks apart)
+    html += '<div class="heatmap-months" style="width:' + (weekCount * 21) + 'px">';
+    var lastLabelCol = -4;
+    for (var i = 0; i < monthLabels.length; i++) {
+      if (monthLabels[i].col - lastLabelCol < 4) continue;
+      lastLabelCol = monthLabels[i].col;
+      html += '<span style="left:' + (monthLabels[i].col * 21) + 'px">' +
+        escapeHtml(monthLabels[i].label) + '</span>';
+    }
+    html += '</div>';
+
+    // Wrapper: day labels + grid
+    html += '<div class="heatmap-wrapper">';
+
+    // Day-of-week labels
+    var dayLabels = ['', 'Mon', '', 'Wed', '', 'Fri', ''];
+    html += '<div class="heatmap-row-labels">';
+    for (var i = 0; i < 7; i++) {
+      html += '<span>' + dayLabels[i] + '</span>';
+    }
+    html += '</div>';
+
+    // Grid cells
+    html += '<div class="heatmap-grid">';
+    for (var i = 0; i < cells.length; i++) {
+      var level = 0;
+      if (cells[i].stats) {
+        var count = cells[i].stats.eventCount;
+        if (maxEvents <= 4) {
+          level = Math.min(count, 4);
+        } else {
+          var pct = count / maxEvents;
+          if (pct <= 0.25) level = 1;
+          else if (pct <= 0.50) level = 2;
+          else if (pct <= 0.75) level = 3;
+          else level = 4;
+        }
+      }
+      html += '<div class="heatmap-cell heatmap-' + level +
+        '" data-hi="' + i + '"></div>';
+    }
+    html += '</div></div>';
+
+    // Legend
+    html += '<div class="heatmap-legend">' +
+      '<span>Less</span>' +
+      '<div class="heatmap-cell heatmap-0"></div>' +
+      '<div class="heatmap-cell heatmap-1"></div>' +
+      '<div class="heatmap-cell heatmap-2"></div>' +
+      '<div class="heatmap-cell heatmap-3"></div>' +
+      '<div class="heatmap-cell heatmap-4"></div>' +
+      '<span>More</span></div>';
+
+    html += '</div>'; // end heatmap-container
+
+    // Summary stats
+    var totalPnl = 0, totalFees = 0, totalVol = 0, totalFunding = 0, totalTrades = 0;
+    var bestDay = null, worstDay = null, busiestDay = null;
+    var bestPnl = -Infinity, worstPnl = Infinity, maxAct = 0;
+    for (var i = 0; i < days.length; i++) {
+      var ds = days[i];
+      totalPnl += ds.totalRealizedPnl;
+      totalFees += ds.totalFees;
+      totalVol += ds.totalVolume;
+      totalFunding += ds.totalFundingPayments;
+      totalTrades += ds.fillCount;
+      if (ds.totalRealizedPnl > bestPnl) { bestPnl = ds.totalRealizedPnl; bestDay = ds.date; }
+      if (ds.totalRealizedPnl < worstPnl) { worstPnl = ds.totalRealizedPnl; worstDay = ds.date; }
+      if (ds.eventCount > maxAct) { maxAct = ds.eventCount; busiestDay = ds.date; }
+    }
+
+    html += '<div class="heatmap-summary">';
+    html += statBox('Total Trades', totalTrades, '');
+    html += statBox('Total rPnL', fmt(totalPnl), pnlClass(totalPnl));
+    html += statBox('Total Fees', fmt(totalFees), 'pnl-neg');
+    html += statBox('Total Volume', fmt(totalVol), '');
+    html += statBox('Total Funding', fmt(totalFunding), pnlClass(totalFunding));
+    html += statBox('Best Day', bestDay + ' (' + fmt(bestPnl) + ')', 'pnl-pos');
+    html += statBox('Worst Day', worstDay + ' (' + fmt(worstPnl) + ')', 'pnl-neg');
+    html += statBox('Busiest Day', busiestDay + ' (' + maxAct + ')', '');
+    html += statBox('Active Days', days.length + ' days', '');
+    html += '</div>';
+
+    // Per-market breakdown table
+    if (markets.length > 0) {
+      html += '<div style="margin-top:16px;padding-top:16px;border-top:1px solid #2D3748">';
+      html += '<h3 style="font-size:13px;color:#A0AEC0;margin-bottom:8px">Per Market</h3>';
+      html += '<table class="log-table" style="font-size:12px">';
+      html += '<thead><tr><th>Market</th><th>Trades</th><th>Volume</th><th>Fees</th><th>rPnL</th><th>Funding</th><th>Fund. Count</th></tr></thead>';
+      html += '<tbody>';
+      for (var mi = 0; mi < markets.length; mi++) {
+        var mk = markets[mi];
+        html += '<tr>';
+        html += '<td>' + escapeHtml(mk.market) + '</td>';
+        html += '<td class="num">' + mk.fillCount + '</td>';
+        html += '<td class="num">' + fmt(mk.totalVolume) + '</td>';
+        html += '<td class="num">' + fmt(mk.totalFees) + '</td>';
+        html += '<td class="num ' + pnlClass(mk.totalRealizedPnl) + '">' + fmt(mk.totalRealizedPnl) + '</td>';
+        html += '<td class="num ' + pnlClass(mk.totalFundingPayments) + '">' + fmt(mk.totalFundingPayments) + '</td>';
+        html += '<td class="num">' + mk.fundingCount + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+    }
+
+    // Tooltip element
+    html += '<div class="heatmap-tooltip" id="heatmap-tooltip"></div>';
+
+    body.innerHTML = html;
+
+    // Store cells for handlers
+    var heatmapCells = cells;
+    var tooltip = document.getElementById('heatmap-tooltip');
+
+    // Hover tooltip
+    body.addEventListener('mouseover', function(e) {
+      var cell = e.target.closest('[data-hi]');
+      if (!cell) { tooltip.classList.remove('visible'); return; }
+      var idx = parseInt(cell.dataset.hi, 10);
+      var cd = heatmapCells[idx];
+      if (!cd) return;
+
+      var th = '<div class="tt-date">' + escapeHtml(cd.date) + '</div>';
+      if (cd.stats) {
+        var s = cd.stats;
+        th += ttRow('Trades', s.fillCount);
+        th += ttRow('Deposits', s.depositCount + ' (' + fmt(s.depositAmount) + ')');
+        th += ttRow('Withdrawals', s.withdrawalCount + ' (' + fmt(s.withdrawalAmount) + ')');
+        th += ttRow('Funding', s.fundingCount);
+        th += ttRow('Volume', fmt(s.totalVolume));
+        th += ttRow('Fees', fmt(s.totalFees));
+        th += ttRow('rPnL', fmt(s.totalRealizedPnl));
+        th += ttRow('Funding PnL', fmt(s.totalFundingPayments));
+        th += ttRow('EOD Equity', fmt(s.endEquity));
+        th += ttRow('EOD QuoteBal', fmt(s.endQuoteBalance));
+      } else {
+        th += '<div style="color:#718096">No activity</div>';
+      }
+      tooltip.innerHTML = th;
+      tooltip.classList.add('visible');
+
+      var rect = cell.getBoundingClientRect();
+      tooltip.style.left = (rect.right + 8) + 'px';
+      tooltip.style.top = (rect.top - 4) + 'px';
+
+      // Keep in viewport
+      var tr = tooltip.getBoundingClientRect();
+      if (tr.right > window.innerWidth - 8) {
+        tooltip.style.left = (rect.left - tr.width - 8) + 'px';
+      }
+      if (tr.bottom > window.innerHeight - 8) {
+        tooltip.style.top = (window.innerHeight - tr.height - 8) + 'px';
+      }
+    });
+
+    body.addEventListener('mouseout', function(e) {
+      if (!e.target.closest('[data-hi]')) {
+        tooltip.classList.remove('visible');
+      }
+    });
+
+    // Click to copy
+    body.addEventListener('click', function(e) {
+      var cell = e.target.closest('[data-hi]');
+      if (!cell) return;
+      var idx = parseInt(cell.dataset.hi, 10);
+      var cd = heatmapCells[idx];
+      if (!cd || !cd.stats) return;
+
+      var json = JSON.stringify(cd.stats, null, 2);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(json).catch(function() {});
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = json;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      cell.style.outline = '2px solid #68D391';
+      setTimeout(function() { cell.style.outline = ''; }, 500);
+    });
+  }
+
+  function statBox(label, value, cls) {
+    return '<div class="heatmap-stat">' +
+      '<div class="stat-value ' + (cls || '') + '">' + escapeHtml(String(value)) + '</div>' +
+      '<div class="stat-label">' + escapeHtml(label) + '</div></div>';
+  }
+
+  function ttRow(label, value) {
+    return '<div class="tt-row"><span class="tt-label">' + escapeHtml(String(label)) +
+      '</span><span>' + escapeHtml(String(value)) + '</span></div>';
+  }
 
 })();

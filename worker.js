@@ -42,15 +42,27 @@ onmessage = function(e) {
   }
 
   else if (msg.type === 'getState') {
-    const json = msg.pricesJson
-      ? engine.get_state_json_with_prices(msg.index, msg.pricesJson)
-      : engine.get_state_json(msg.index);
+    const hasPrices = !!msg.pricesJson;
+    const hasAdj = typeof msg.adjustment === 'number' && Math.abs(msg.adjustment) > 1e-12;
+    let json;
+    if (hasAdj) {
+      json = engine.get_state_json_full(msg.index, msg.pricesJson || '{}', msg.adjustment);
+    } else if (hasPrices) {
+      json = engine.get_state_json_with_prices(msg.index, msg.pricesJson);
+    } else {
+      json = engine.get_state_json(msg.index);
+    }
     postMessage({ type: 'state', json: json, index: msg.index });
   }
 
   else if (msg.type === 'getLogPage') {
     const json = engine.get_log_page_json(msg.start, msg.end);
     postMessage({ type: 'logPage', json: json });
+  }
+
+  else if (msg.type === 'getDailyStats') {
+    const json = engine.get_daily_stats_json();
+    postMessage({ type: 'dailyStats', json: json });
   }
 };
 
