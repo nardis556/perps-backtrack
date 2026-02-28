@@ -1024,3 +1024,317 @@ impl Engine {
         serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
     }
 }
+
+// ============================================================
+// TESTS
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_position(market: &str) -> Position {
+        Position::new(market)
+    }
+
+    fn entry_price(pos: &Position) -> f64 {
+        let abs_q = pos.quantity.abs();
+        if abs_q == 0 { return 0.0; }
+        // total_notional is SCALE^2, abs_q is SCALE → result is SCALE
+        to_f64_s1(pos.total_notional / abs_q)
+    }
+
+    fn p(s: &str) -> i128 { parse_fixed(s) }
+
+    fn fill(positions: &mut HashMap<String, Position>, market: &str, side: &str, price: &str, qty: &str, fee: &str, rpnl: &str) {
+        Engine::process_fill(
+            positions, market, side,
+            p(price), p(price), // index_price = price
+            p(qty), p(fee), p(rpnl),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Basic: single fill opens a long
+    // ----------------------------------------------------------
+    #[test]
+    fn test_single_buy_opens_long() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+        fill(&mut positions, "BTC-USD", "buy", "50000.00", "1.00", "20.00", "0.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), 1.0);
+        assert!((entry_price(pos) - 50000.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Basic: single fill opens a short
+    // ----------------------------------------------------------
+    #[test]
+    fn test_single_sell_opens_short() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+        fill(&mut positions, "BTC-USD", "sell", "60000.00", "2.00", "24.00", "0.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), -2.0);
+        assert!((entry_price(pos) - 60000.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Weighted average: multiple buys at different prices
+    // ----------------------------------------------------------
+    #[test]
+    fn test_weighted_average_entry_multiple_buys() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Buy 100 @ $50
+        fill(&mut positions, "BTC-USD", "buy", "50.00", "100.00", "0.00", "0.00");
+        let pos = &positions["BTC-USD"];
+        assert!((entry_price(pos) - 50.0).abs() < 0.01);
+
+        // Buy 100 more @ $60
+        fill(&mut positions, "BTC-USD", "buy", "60.00", "100.00", "0.00", "0.00");
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), 200.0);
+        // Weighted avg: (100*50 + 100*60) / 200 = 55
+        assert!((entry_price(pos) - 55.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Weighted average: multiple sells at different prices (short)
+    // ----------------------------------------------------------
+    #[test]
+    fn test_weighted_average_entry_multiple_sells() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Sell 50 @ $100
+        fill(&mut positions, "BTC-USD", "sell", "100.00", "50.00", "0.00", "0.00");
+        // Sell 150 @ $120
+        fill(&mut positions, "BTC-USD", "sell", "120.00", "150.00", "0.00", "0.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), -200.0);
+        // Weighted avg: (50*100 + 150*120) / 200 = (5000 + 18000) / 200 = 115
+        assert!((entry_price(pos) - 115.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Weighted average: 3 fills, unequal sizes
+    // ----------------------------------------------------------
+    #[test]
+    fn test_weighted_average_three_fills_unequal() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Buy 10 @ $100
+        fill(&mut positions, "BTC-USD", "buy", "100.00", "10.00", "0.00", "0.00");
+        // Buy 30 @ $110
+        fill(&mut positions, "BTC-USD", "buy", "110.00", "30.00", "0.00", "0.00");
+        // Buy 60 @ $120
+        fill(&mut positions, "BTC-USD", "buy", "120.00", "60.00", "0.00", "0.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), 100.0);
+        // Weighted avg: (10*100 + 30*110 + 60*120) / 100 = (1000 + 3300 + 7200) / 100 = 115
+        assert!((entry_price(pos) - 115.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Partial close: entry price stays the same
+    // ----------------------------------------------------------
+    #[test]
+    fn test_partial_close_preserves_entry_price() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Build a long: buy 100 @ $50, buy 100 @ $60 → avg $55
+        fill(&mut positions, "BTC-USD", "buy", "50.00", "100.00", "0.00", "0.00");
+        fill(&mut positions, "BTC-USD", "buy", "60.00", "100.00", "0.00", "0.00");
+        assert!((entry_price(&positions["BTC-USD"]) - 55.0).abs() < 0.01);
+
+        // Sell 50 (partial close) @ $70
+        fill(&mut positions, "BTC-USD", "sell", "70.00", "50.00", "0.00", "750.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), 150.0);
+        // Entry price should still be $55
+        assert!((entry_price(pos) - 55.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Full close: position goes to zero
+    // ----------------------------------------------------------
+    #[test]
+    fn test_full_close() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        fill(&mut positions, "BTC-USD", "buy", "50.00", "100.00", "0.00", "0.00");
+        fill(&mut positions, "BTC-USD", "sell", "60.00", "100.00", "5.00", "1000.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(pos.quantity, 0);
+        assert_eq!(pos.total_notional, 0);
+    }
+
+    // ----------------------------------------------------------
+    // Position flip: long to short
+    // ----------------------------------------------------------
+    #[test]
+    fn test_flip_long_to_short() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Open long 100 @ $50
+        fill(&mut positions, "BTC-USD", "buy", "50.00", "100.00", "0.00", "0.00");
+        assert_eq!(to_f64_s1(positions["BTC-USD"].quantity), 100.0);
+
+        // Sell 150 @ $60 → flip to short 50
+        fill(&mut positions, "BTC-USD", "sell", "60.00", "150.00", "0.00", "1000.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), -50.0);
+        // New entry price should be $60 (the flip price)
+        assert!((entry_price(pos) - 60.0).abs() < 0.01);
+        // Cumulative tracking resets on flip
+        assert_eq!(pos.cumulative_fees, p("0.00"));
+    }
+
+    // ----------------------------------------------------------
+    // Position flip: short to long
+    // ----------------------------------------------------------
+    #[test]
+    fn test_flip_short_to_long() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Open short 80 @ $100
+        fill(&mut positions, "BTC-USD", "sell", "100.00", "80.00", "0.00", "0.00");
+        // Buy 120 @ $90 → flip to long 40
+        fill(&mut positions, "BTC-USD", "buy", "90.00", "120.00", "0.00", "800.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), 40.0);
+        assert!((entry_price(pos) - 90.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Close then re-open: entry price resets
+    // ----------------------------------------------------------
+    #[test]
+    fn test_close_then_reopen() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Open long @ $50
+        fill(&mut positions, "BTC-USD", "buy", "50.00", "100.00", "0.00", "0.00");
+        // Close @ $60
+        fill(&mut positions, "BTC-USD", "sell", "60.00", "100.00", "0.00", "1000.00");
+        assert_eq!(positions["BTC-USD"].quantity, 0);
+
+        // Re-open long @ $70 — entry should be $70, not $50
+        fill(&mut positions, "BTC-USD", "buy", "70.00", "50.00", "0.00", "0.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), 50.0);
+        assert!((entry_price(pos) - 70.0).abs() < 0.01);
+        // Cumulative tracking resets on fresh open
+        assert_eq!(pos.cumulative_realized_pnl, 0);
+    }
+
+    // ----------------------------------------------------------
+    // Multiple partial closes: entry stays, fees accumulate
+    // ----------------------------------------------------------
+    #[test]
+    fn test_multiple_partial_closes() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Open long 100 @ $50
+        fill(&mut positions, "BTC-USD", "buy", "50.00", "100.00", "2.00", "0.00");
+
+        // Close 30 @ $55
+        fill(&mut positions, "BTC-USD", "sell", "55.00", "30.00", "1.65", "150.00");
+        assert_eq!(to_f64_s1(positions["BTC-USD"].quantity), 70.0);
+        assert!((entry_price(&positions["BTC-USD"]) - 50.0).abs() < 0.01);
+
+        // Close 30 more @ $60
+        fill(&mut positions, "BTC-USD", "sell", "60.00", "30.00", "1.80", "300.00");
+        assert_eq!(to_f64_s1(positions["BTC-USD"].quantity), 40.0);
+        assert!((entry_price(&positions["BTC-USD"]) - 50.0).abs() < 0.01);
+
+        // Close remaining 40 @ $65
+        fill(&mut positions, "BTC-USD", "sell", "65.00", "40.00", "2.60", "600.00");
+        assert_eq!(positions["BTC-USD"].quantity, 0);
+
+        // Fees should have accumulated: 2 + 1.65 + 1.80 + 2.60 = 8.05
+        assert!((to_f64_s1(positions["BTC-USD"].cumulative_fees) - 8.05).abs() < 0.01);
+        // rPnL should have accumulated: 0 + 150 + 300 + 600 = 1050
+        assert!((to_f64_s1(positions["BTC-USD"].cumulative_realized_pnl) - 1050.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Multi-market: positions are independent
+    // ----------------------------------------------------------
+    #[test]
+    fn test_multi_market_independent() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        fill(&mut positions, "BTC-USD", "buy", "50000.00", "1.00", "20.00", "0.00");
+        fill(&mut positions, "ETH-USD", "sell", "2000.00", "10.00", "8.00", "0.00");
+
+        assert_eq!(to_f64_s1(positions["BTC-USD"].quantity), 1.0);
+        assert!((entry_price(&positions["BTC-USD"]) - 50000.0).abs() < 0.01);
+
+        assert_eq!(to_f64_s1(positions["ETH-USD"].quantity), -10.0);
+        assert!((entry_price(&positions["ETH-USD"]) - 2000.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Stress: many small fills averaging out
+    // ----------------------------------------------------------
+    #[test]
+    fn test_many_small_fills() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // 100 fills of 1.0 each at prices $100..$199
+        for i in 0..100 {
+            let price = format!("{}.00", 100 + i);
+            fill(&mut positions, "BTC-USD", "buy", &price, "1.00", "0.00", "0.00");
+        }
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), 100.0);
+        // Average of 100..199 = 149.5
+        assert!((entry_price(pos) - 149.5).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Flip with accumulated avg: verify old avg doesn't leak
+    // ----------------------------------------------------------
+    #[test]
+    fn test_flip_clears_old_average() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Build long with complex avg: buy 50 @ $100, buy 50 @ $200 → avg $150
+        fill(&mut positions, "BTC-USD", "buy", "100.00", "50.00", "0.00", "0.00");
+        fill(&mut positions, "BTC-USD", "buy", "200.00", "50.00", "0.00", "0.00");
+        assert!((entry_price(&positions["BTC-USD"]) - 150.0).abs() < 0.01);
+
+        // Flip to short by selling 120 @ $180 → short 20 @ $180
+        fill(&mut positions, "BTC-USD", "sell", "180.00", "120.00", "0.00", "3000.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(to_f64_s1(pos.quantity), -20.0);
+        // Entry must be $180, NOT influenced by old $150 avg
+        assert!((entry_price(pos) - 180.0).abs() < 0.01);
+    }
+
+    // ----------------------------------------------------------
+    // Tiny quantities: precision at 8 decimal places
+    // ----------------------------------------------------------
+    #[test]
+    fn test_tiny_quantity_precision() {
+        let mut positions: HashMap<String, Position> = HashMap::new();
+
+        // Buy 0.00010000 BTC @ $67000
+        fill(&mut positions, "BTC-USD", "buy", "67000.00", "0.00010000", "0.00", "0.00");
+
+        let pos = &positions["BTC-USD"];
+        assert_eq!(pos.quantity, 10000); // 0.0001 * SCALE
+        assert!((entry_price(pos) - 67000.0).abs() < 1.0);
+    }
+}
