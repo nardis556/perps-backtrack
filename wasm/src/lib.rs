@@ -345,26 +345,28 @@ impl Engine {
                 }
             }
             Event::Fill { fill_type, side, price, index_price, quantity, quote_quantity, fee, realized_pnl, market, .. } => {
+                // Apply quote balance change: buy spends USDC, sell receives USDC
+                let mut updated_balance = quote_balance;
+                if side == "buy" {
+                    updated_balance -= quote_quantity;
+                } else {
+                    updated_balance += quote_quantity;
+                }
+                updated_balance -= fee;
+
                 if fill_type == "liquidation" {
-                    for position in positions.values_mut() {
+                    // Liquidation closes the position in this market;
+                    // quote balance follows normal buy/sell accounting
+                    if let Some(position) = positions.get_mut(market.as_str()) {
+                        position.cumulative_realized_pnl += realized_pnl;
+                        position.cumulative_fees += fee;
                         position.quantity = 0;
                         position.total_notional = 0;
-                        position.cumulative_realized_pnl = 0;
-                        position.cumulative_fees = 0;
-                        position.cumulative_funding = 0;
                     }
-                    0
                 } else {
-                    let mut updated_balance = quote_balance;
-                    if side == "buy" {
-                        updated_balance -= quote_quantity;
-                    } else {
-                        updated_balance += quote_quantity;
-                    }
-                    updated_balance -= fee;
                     Self::process_fill(positions, market, side, *price, *index_price, *quantity, *fee, *realized_pnl);
-                    updated_balance
                 }
+                updated_balance
             }
             Event::Funding { market, payment_quantity, index_price, .. } => {
                 let position = positions.entry(market.clone()).or_insert_with(|| Position::new(market));
